@@ -1,0 +1,57 @@
+; gibl: define data
+
+;* data.s: ======================================================================
+
+;* data.h: ======================================================================
+
+;********************************************************************************
+ .zeropage ; Zero page data
+
+arithStackSize	= 13 * 2
+arithStack:	.res arithStackSize	; Arithmetic stack for expression evaluation
+
+ArithIndex:	.res 1		; ArithStack index
+DoIndex:	.res 1		; DO stack index
+ForIndex:	.res 1		; FOR stack index
+GosubIndex:	.res 1		; GOSUB stack index
+RStack0:	.res 1		; initial return stack index
+runMod:		.res 1		; Run/Edit flag
+findlFlag:	.res 1		; Flag used in findLine
+
+CurLineNum:	.res 2		; Current BASIC line number
+Cursor:		.res 2 		; BASIC text ptr
+svCursor:	.res 2
+
+Top:		.res 2		; Ptr to end of the BASIC program text
+
+RegA:		.res 2
+RegB:		.res 2		; GP
+RegC:		.res 2		; GP
+
+num:		.res 1		; Used in ERR & others
+temp0:		.res 1		; Temporary byte store
+PrngState:	.res 2		; Used in the PRNG
+
+
+;********************************************************************************
+ .data ; non-ZP data
+
+varSize0	= 1+'Z'-'@'	; 27 variables - @ - Z
+variablesL:	.res varSize0	; lo byte; Variables; @-Z
+variablesH:	.res varSize0	; hi byte
+
+GosubStackSize	= 8 * 2		; 8 nested GOSUBs
+GosubStack:	.res GosubStackSize	; GOSUB stack
+			; .dw return Cursor value
+
+doStackSize	= 8 * 2
+doStack:	.res doStackSize	; DO stack
+			; .dw return Cursor value
+
+forStackSize	= 8 * 7
+forStack:	.res forStackSize	; FOR stack
+			; .db variable index
+			; .dw limit
+			; .dw step 
+			; .dw branch back Cursor value
+

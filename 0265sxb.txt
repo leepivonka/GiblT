@@ -1,0 +1,353 @@
+; turboGIBL for 0265sxb board
+
+; Compile with ca65 from https://cc65.github.io/ (formerly cc65.org)
+
+	.list on
+	.listbytes unlimited  ;include all object bytes in listing (since we load the listing file)
+	.feature loose_string_term ; used to put quotes in strings
+	.feature org_per_seg
+
+
+; Initialize segments to generate absolute addresses in listing file.
+; Load into the simulator by report-scraping the listing.
+; Or we could leave these relative & use the CC65 linker to generate a binary file.
+
+	.zeropage ; ZP RAM
+	.org $0000	; absolute, so listing contains real addresses
+Temp:	.res 8		; non-preserved work area
+iLen:	.res 1		; Current input line length and...
+
+
+	.data		; non-ZP RAM
+	.org $200  ;absolute, so listing contains real addresses
+
+maxLen		= 78	; Maximum size of input line
+lineInput:	.res maxLen	; keyboard input line buffer
+
+
+	.code		; ROM
+	.org $7000	; absolute, so listing contains real addresses
+			; for now, we just load the code in hi RAM
+
+
+
+	.include "gibltd.txt"  ; turboGIBL data
+
+
+	.code
+Start: ; ROM entry point.
+
+	sei			; we don't have the interrupt stuff set up
+	sec			; make sure we're in 6502 emulation mode
+	.byte $fb		;   xce
+
+	cld			; for older 6502s
+	ldx #$FF		; init return stack index
+	txs
+
+	jsr ConsoleInit
+
+; Local system setup is complete
+
+	jmp gibl
+
+
+;********************************************************************************
+;* routines gibl needs:
+;*	putChar  - Print character in A.
+;*	newLine  - Output a CR+LF
+;*	putStr	 - Output a string in-line with progam code.
+;*	getChar	 - Return character in A.
+;*	getLine	 - Read in a line of text
+;*			Line is CR terminated and located at lineInput.
+;*	CheckKbdInt - Check for Ctrl-C or whatever.
+;*
+;*	In-General you need to preserve X and Y with data passed in/out in A.
+
+
+ .if 1 ; simulator =================================================================
+
+ConsoleInit: rts
+
+
+getChar: ; Wait-for and read a single character back into A.
+@2:	inc PrngState	; randomize the random number state
+	.byte $22 ; jsl
+	  .word $e033	; MenschROM.GET_BYTE_FROM_PC
+	  .byte 0
+	bcs @2		; until we got one
+	rts
+
+
+CheckKbdInt: ; Check for a keyboard interrupt.
+  ; will be called regularly during program execution and listing. 
+	rts	; not implemented yet.
+
+
+putChar: ; Print a single character in A. Preserve X & Y.
+	.byte $da	; phx
+	.byte $5a	; phy
+	sta 2+Temp
+@2:	lda 2+Temp	; try to send char
+	.byte $22 ; jsl
+	  .word $e063 ;MenschRom.SEND_BYTE_TO_PC
+	  .byte 0
+	bcs @2		; until it is accepted
+	.byte $7a	; ply
+	.byte $fa	; plx
+	rts
+
+
+newLine: ; Output a newline to the terminal. Preserve X & Y.
+	lda #$0d		; carriage return
+	jsr putChar
+	lda #$0a		; line feed
+	bne putChar
+
+
+ .else ; WDC 0265sxb board ===================================================
+
+; This is a 6502 program so we want to run the 65816 CPU in emulation mode.
+; Unfortunately the routines in the 0265sxb MenschROM only work in native mode.
+; Further, the emulation mode interrupt vectors all point at ROM Reset.
+; Se we turn off interrupts & supply polled replacement console I/O routines.
+
+UIFR	= $DF48 ;UART INTERRUPT FLAG REGISTER
+UART0R = $01	;BIT 0-UART0 RECEIVE 1 = INTERRUPT PENDING
+UART0T = $02	;BIT 1-UART0 TRANSMIT 1 = INTERRUPT PENDING
+UART1R = $04	;BIT 2-UART1 RECEIVE 1 = INTERRUPT PENDING
+UART1T = $08	;BIT 3-UART1 TRANSMIT 1 = INTERRUPT PENDING
+UART2R = $10	;BIT 4-UART2 RECEIVE 1 = INTERRUPT PENDING
+UART2T = $20	;BIT 5-UART2 TRANSMIT 1 = INTERRUPT PENDING
+UART3R = $40	;BIT 6-UART3 RECEIVE 1 = INTERRUPT PENDING
+UART3T = $80	;BIT 7-UART3 TRANSMIT 1 = INTERRUPT PENDING
+
+UIER	= $DF49 ;UART INTERRUPT ENABLE REGISTER
+	;BIT 0-UART0 RECEIVE 1 = ENABLE IRQ
+	;BIT 1-UART0 TRANSMIT 1 = ENABLE IRQ
+	;BIT 2-UART1 RECEIVE 1 = ENABLE IRQ
+	;BIT 3-UART1 TRANSMIT 1 = ENABLE IRQ
+	;BIT 4-UART2 RECEIVE 1 = ENABLE IRQ
+	;BIT 5-UART2 TRANSMIT 1 = ENABLE IRQ
+	;BIT 6-UART3 RECEIVE 1 = ENABLE IRQ
+	;BIT 7-UART3 TRANSMIT 1 = ENABLE IRQ
+
+ACSR0 = $DF70 ;ASYNCH. CONTROL/STATUS REGISTER 0
+	;BIT 0-XMIT PORT ENABLE
+	;BIT 1-XMIT IRQ 
+	;BIT 2-7/8 BIT DATA
+	;BIT 3-PARITY ENABLE
+	;BIT 4-ODD/EVEN PARITY
+	;BIT 5-RECV ENABLE
+	;BIT 6-SOFTWARE SEMIPHORE
+	;BIT 7-RECV ERROR FLG
+ARTD0 = $DF71 ;ASYNCH. RECVR/TRANSMTR DATA REGISTER 0
+ACSR1 = $DF72 ;ASYNCH. CONTROL/STATUS REGISTER 1
+ARTD1 = $DF73 ;ASYNCH. RECVR/TRANSMTR DATA REGISTER 1
+ACSR2 = $DF74 ;ASYNCH. CONTROL/STATUS REGISTER 2
+ARTD2 = $DF75 ;ASYNCH. RECVR/TRANSMTR DATA REGISTER 2
+ACSR3 = $DF76 ;ASYNCH. CONTROL/STATUS REGISTER 3
+ARTD3 = $DF77 ;ASYNCH. RECVR/TRANSMTR DATA REGISTER 3
+
+  .zeropage
+Uart3RxInsert: .res 1	; RX queue insert index
+Uart3RxExtract: .res 1	; RX queue extract index
+
+  .data
+Uart3RxQueSize = $100
+Uart3RxQue: .res Uart3RxQueSize
+
+  .code
+
+ConsoleInit:
+	lda #0
+	sta Uart3RxInsert
+	sta Uart3RxExtract
+	rts
+
+
+CheckRx: ; move rx hardware to queue
+	lda UIFR		; UART Rx ready?
+	and #UART3R
+	beq @4
+	lda ARTD3		; insert in queue
+	.byte $da	;phx
+	ldx Uart3RxInsert
+	sta Uart3RxQue,x
+	inx
+	txa
+;	and #Uart3RxQueSize-1
+	sta Uart3RxInsert
+	.byte $fa	;plx
+@4:	lda Uart3RxExtract
+	cmp Uart3RxInsert
+	rts
+
+
+getChar: ; Wait-for and read a single character back into A.
+@2:	inc PrngState		; randomize the random number state
+	jsr CheckRx		; do Rx chars
+	beq @2			; any Rx ready?
+	.byte $da	;phx	; extract char from que
+	ldx Uart3RxExtract
+	lda Uart3RxQue,x
+	inx
+;	cpx #Uart3RxQueSize
+;	bcc @3
+;	ldx #0
+@3:	stx Uart3RxExtract
+	.byte $fa	;plx
+	rts
+
+
+CheckKbdInt: ; Check for a keyboard interrupt.
+  ; will be called regularly during program execution and listing. 
+	jsr CheckRx		; do Rx chars
+	bne @GotInt		; any Rx ready?
+	rts
+
+@GotInt:
+;	pla			; Remove JSR
+;	pla
+	lda #eBRK
+	jmp progErr
+
+
+putChar: ; Print a single character in A. Preserve X & Y
+	pha
+@2:	jsr CheckRx		; do Rx chars
+	lda UIFR		; Tx ready?
+	and #UART3T
+	beq @2
+	pla			; send char
+	sta ARTD3
+	rts
+
+
+newLine: ; Output a newline to the terminal. Preserve X & Y.
+	lda #$0d
+			; MenschROM omits linefeeds, so we'll do the same.
+;	jsr putChar
+;	lda #$0a
+	bne putChar
+
+ .endif ;=======================================================================
+
+;********************************************************************************
+putStr: ; Print a zero-terminated string stored in-line with the program code.
+  ;	Usage:
+  ;		jsr	putStr
+  ;		.byte	"Hello, world", 0
+
+	pla		; Pull rts addr to use to get the data from
+	sta Temp+4
+	pla
+	sta Temp+5
+	bne @3
+
+@1:	jsr putChar
+
+@3:	inc Temp+4
+	bne @2
+	inc Temp+5
+@2:	ldy #0
+	lda (Temp+4),y
+	bne @1
+
+	lda Temp+5	; Push rts addr
+	pha
+	lda Temp+4
+	pha
+
+	rts
+
+;********************************************************************************
+getLine:  ; Read in a line of text with simple editing.
+  ;	Input line must be terminated by a CR (decimal 13) code and be under 127
+  ;	bytes long including the CR.
+  ;
+  ; (Simple) Editing:
+  ;	Backspace or DEL: Delete char to left of cursor
+  ;	Ctrl-C:           Delete whole line
+  ;
+  ; Entry:
+  ;	Acc has the prompt character.
+  ;
+  ; Exit:
+  ;	Data stored at lineInput with a terminating CR.
+
+	sta temp0		; Save prompt
+
+@0:
+	lda temp0		; Output prompt:
+	jsr putChar
+	lda #0			; Zero length
+	sta iLen
+
+@Loop:
+	jsr getChar
+
+	cmp #KEY_CTRL_C
+	beq @Cancel
+	cmp #KEY_BS		; Backspace?
+	beq @BackSpace
+	cmp #KEY_CR
+	beq @return
+	cmp #KEY_NL
+	beq @return
+	cmp #KEY_SPACE
+	bcc @Loop		; Ignore all other control characters
+	cmp #KEY_DEL		; DELete?
+	beq @BackSpace
+	bcs @Loop		; Ignore characters > 127
+
+	; Ordinary printable character
+	ldy iLen		; Buffer full?
+	cpy #maxLen-1
+	bcs @Loop
+	sta lineInput,y
+	jsr putChar
+	inc iLen
+	bne @Loop
+
+@Cancel: ; Cancel the line
+	jsr putStr
+	  .byte "\",13,10,0
+	jmp @0
+
+@BackSpace:
+	lda iLen
+	beq @Loop			; Already at the start?
+	jsr putStr
+	  .byte KEY_BS,' ',KEY_BS,0	; Backspace, space, backspace..
+	dec iLen
+	jmp @Loop
+
+@return:  ; Terminate and return the line
+	ldy	iLen		; Store CR
+	lda	#KEY_CR		; In-case we got here from a newline
+	sta	lineInput,y
+	jsr	newLine		; Take a newline
+
+.ifdef	GETLINE_SYSCALL
+	jsr rubyCommandCheck	; Check for some specific OS commands
+	beq @0
+.endif
+
+	rts
+
+
+
+ .include "gibltc.txt" ; turboGIBL code
+
+
+	.data
+	; must be after all other .data segment definitions
+BasicStart: ; BASIC program text starts here and grow up
+
+
+
+	.code
+	.org $fffc ; hardware vectors for the simulator
+	.word Start		; CPU reset vector
+

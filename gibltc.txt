@@ -1,0 +1,2417 @@
+;********************************************************************************
+;* A Tiny Basic for the 6502 inspired by the NIBL Tiny Basic interpreter;
+;* "National Industrial Basic Language" originally for the INS8060 SC/MP system.
+;*
+;* http://cini.classiccmp.org/pdf/NatSemi/SCMPNIBL.PDF
+
+; Modifications & additions to gibl by Lee Pivonka,
+;   mostly to improve BASIC execution performance.
+; Compiles 6502 code for the IL instructions.  There is no IL interpreter.
+; BASIC text compares are partially inlined.
+; BASIC text blank skipping mostly moved from compares to text consumers.
+
+; This is based on gibl from https://project-downloads.drogon.net/gibl/  release 3:
+;	Gordons Interactive Basic Language
+;	gibl is Copyright (c) 2023 by Gordon Henderson
+;	  It is NOT Open source and must not be treated as such.
+;
+;	The "Source Available" license for gibl:
+;	*******************************************************************************
+;	*     Use this software at your own risk.                                     *
+;	*     It is supplied with no warranty for any purpose whatsoever.             *
+;	*                                                                             *
+;	*     You may use, copy and modify this software for your own personal use.   *
+;	*                                                                             *
+;	*     You can incorporate all or part of it into your own systems but you     *
+;	*     must not sell those systems or any systems containing this software     *
+;	*     without purchasing a resell license from Gordon Henderson.              *
+;	*******************************************************************************
+
+
+;* release.h: ===================================================================
+
+release	= 3
+
+
+;* keys.h: ======================================================================
+;*	Some key/character definitions
+
+KEY_CTRL_A	=	  1	; Line edit: Start of line
+KEY_CTRL_C	=	  3	; Abandon line
+KEY_CTRL_D	=	  4	; Delete char under the Cursor
+KEY_CTRL_E	=	  5	; Line edit: End of line
+
+KEY_CTRL_K	=	 11	; Line kill
+KEY_CTRL_U	=	 21	; Line kill
+
+KEY_START	=	KEY_CTRL_A
+KEY_END		=	KEY_CTRL_E
+KEY_DEL_UNDER	=	KEY_CTRL_D
+KEY_BS		=	  8	; Ctrl-H
+KEY_LEFT	=	  8	;   Alias
+KEY_FF		=	 12	; Ctrl-L
+KEY_RIGHT	=	 12	;   Alias
+KEY_NL		=	 10	
+KEY_LF		=	 10	; Alias
+KEY_CR		=	 13	; Return
+KEY_ESC		=	 27
+KEY_SPACE	=	 32
+KEY_TAB		=	  9
+KEY_DEL		=	127
+
+VDU_LEFT	=	  8
+VDU_HOME	=	 12
+
+
+;* gibl.h: =======================================================================
+
+;* gibl.s: =======================================================================
+;*	Generic startup after doing all the system specific stuff.
+
+ ;========================================================================
+gibl: ; Main GIBL entry point
+
+; Setup screen and say hello.
+;	... possibly a bit too verbose when the aim
+;	 is under 4K but we're well on-track there. For now.
+
+	jsr putStr
+	.byte 12,					10	; Clears most screens...
+
+ .if 0 ; VERBOSE_BANNER
+	.byte	"  ____ ___ ____  _",			13,10
+	.byte	" / ___|_ _| __ )| |",			13,10
+	.byte	"| |  _ | ||  _ \| |",			13,10
+	.byte	"| |_| || || |_) | |___",		13,10
+ 	.byte	" \____|___|____/|_____|",		13,10,10
+   .endif
+
+ .if 0 ; BRIEF_BANNER
+	.byte	"Gordons Interactive BASIC Language: "
+	.byte	.sprintf ("r%02d", release),		13,10
+   .endif
+
+ .if 1 ; TINY_BANNER
+	.byte	"GIBL: "
+	.byte	.sprintf ("r%02d", release),		13,10
+   .endif
+
+	.byte " turbo",					13,10
+	.byte 0
+
+	jmp ilBegin
+
+
+; ilMacros.s: ===================================================================
+
+.macro strTop str  ; Include a string but set the top-bit of the last character
+	.repeat .strlen(str)-1,I			; All but the last
+	  .byte    .strat(str,I)
+	.endrep
+	.byte   .strat(str,.strlen(str)-1) | $80	; The last character
+	.endmacro
+
+.macro incCursor  ; Increment the Cursor pointer
+  .local @over
+	inc	Cursor+0
+	bne	@over
+	inc	Cursor+1
+@over:
+	.endmacro
+
+.macro bumpCursor N  ; Add a value to the Cursor pointer
+	lda #N
+	jsr BumpCursorA
+	.endmacro
+
+BumpCursorA: ; add A to the Cursor pointer
+	clc
+	adc Cursor+0
+	sta Cursor+0
+	bcc @9
+	inc Cursor+1
+@9:	rts
+
+;* logic.h: ======================================================================
+
+;* logic.s: ======================================================================
+
+andOP:  ; bitwise AND ( n1 n2 -- n3 )
+	ldx	ArithIndex
+
+	lda	arithStack-2,x		; Lo byte
+	and	arithStack-4,x
+	sta	arithStack-4,x
+
+	lda	arithStack-1,x		; Hi byte
+	and	arithStack-3,x
+	sta	arithStack-3,x
+
+	jmp DropX
+
+
+orOP:  ; bitwise OR ( n1 n2 -- n3 )
+	ldx	ArithIndex
+
+	lda	arithStack-2,x		; Lo byte
+	ora	arithStack-4,x
+	sta	arithStack-4,x
+
+	lda	arithStack-1,x		; Hi byte
+	ora	arithStack-3,x
+	sta	arithStack-3,x
+
+	jmp	DropX
+
+
+notOP:  ; Logical NOT ( n -- f )
+	;   0 -> 1 and anything non-zero -> 0
+	; NOTE:
+	;	This used to be a Ones compliment operation...
+
+	ldx ArithIndex
+	ldy #0				; Y=false
+	lda arithStack-2,x
+	ora arithStack-1,x
+	bne @1
+	iny				; Y=true
+@1:	sty arithStack-2,x		; Low
+	lda #0
+	sta arithStack-1,x		; High
+	rts
+
+;* arith.h: ======================================================================
+
+;* arith.s: ======================================================================
+
+ .if 0 ; Debug
+TwoArgs: ; verify there are 2 arguments available
+	ldx ArithIndex		; 2 args present?
+	cpx #4
+	bcc :+
+	rts
+
+:	.byte $42	; WDM breakpoint
+  .endif
+
+
+SUB:  ; Take top 2 items off the stack, subtract them, put the result back.
+	;	s[1] := s[1] - s[0] ; sp--
+
+	ldx	ArithIndex
+
+	sec
+	lda	arithStack-4,x		; s[1] low
+	sbc	arithStack-2,x		; s[0] low
+	sta	arithStack-4,x
+
+	lda	arithStack-3,x		; s[1] high
+	sbc	arithStack-1,x		; s[0] high
+	sta	arithStack-3,x
+
+	jmp AddFinish
+
+
+ADD:  ; Take top 2 items off the stack, add them, put the result back.
+	;	s[1] := s[1] + s[0] ; sp--
+
+	ldx	ArithIndex
+;	jsr TwoArgs		;debug???
+
+	clc
+	lda	arithStack-4,x		; lo byte
+	adc	arithStack-2,x
+	sta	arithStack-4,x
+
+	lda	arithStack-3,x		; hi byte
+	adc	arithStack-1,x
+	sta	arithStack-3,x
+
+AddFinish: ; finish up
+	bvs Overflow
+
+DropX:  ; X=ArithIndex
+	dex				; drop TOS
+	dex
+	stx	ArithIndex
+	rts
+
+
+Overflow:
+	lda	#eVALU
+	jmp	progErr
+
+
+fixSigns:  ; Record and fix (make positive) the signs of the top 2 numbers
+	; on the arith stack.
+
+	ldx ArithIndex
+
+	lda arithStack-1,x	; num = result_sign
+	eor arithStack-3,x
+	sta num
+
+	lda arithStack-3,x	; abs NOS
+	bpl :+
+	dex
+	dex
+	jsr NegateX
+	ldx ArithIndex
+:
+	lda arithStack-1,x	; abs TOS
+	bmi NegateX
+
+	rts
+
+
+Negate:  ; ( n --- n ) Negate the top item on the stack
+	ldx ArithIndex
+NegateX:
+	sec
+	lda #0
+	sbc arithStack-2,x	; s[0] low
+	sta arithStack-2,x
+
+	lda #0
+	sbc arithStack-1,x	; s[0] high
+	sta arithStack-1,x
+	bvs Overflow
+
+	rts
+
+; .align 32
+;********************************************************************************
+.proc MUL  ; Take top 2 items off the stack, multiply them, put the result back.
+  ;		s[1] := s[1] * s[0] ; sp--
+  ;
+  ; NOS and RegC are used to hold the 32-bit result.
+  ; Algorithm is naive, but works well. Faster ones are out there...
+
+;	jsr TwoArgs		; debug???
+
+	jsr fixSigns		; Check signs and make positive if needed
+
+	lda #0
+	sta RegC+0		; Zero result.hiword in A & RegC+0
+
+	ldx ArithIndex
+	lsr arithStack-3,x	; shift out 1st multiplier bit
+	ror arithStack-4,x
+	ldy #16			; Loop for 16 bits
+@Loop:
+	bcc @2			;   if multiplier bit set
+
+	pha			;     add multiplicand into the result.hiword
+	clc
+	lda arithStack-2,x
+	adc RegC+0
+	sta RegC+0
+	pla
+	adc arithStack-1,x
+
+@2:	ror a			;   shift result & multiplier right
+	ror RegC+0
+	ror arithStack-3,x
+	ror arithStack-4,x
+
+	dey
+	bne @Loop
+
+	sta RegC+1		; Store top byte of result.hiword
+; 32-bit result now in arithStack-4 (lo word) & RegC (hi word)
+
+	ora RegC+0		; check for overflow
+	bne Overflow
+
+	dex			; drop TOS
+	dex
+	stx ArithIndex
+
+	lda num
+	bmi Negate
+	rts
+.endproc
+
+
+; .align 32
+;********************************************************************************
+DIV:  ; ( dividend divisor -- quotient )
+  ; Pop divisor & dividend, divide, push quotient
+
+	jsr	RemDiv
+
+	lda	num		; Check/Fix sign
+	bmi	NegA
+	rts
+
+
+NegA:	jmp Negate
+
+
+MOD:  ; ( dividend divisor -- remainder )
+  ; Pop divisor & dividend, divide, push remainder
+	jsr	RemDiv
+
+;	ldx	ArithIndex
+	lda	RegC+0		; Remainder in RegC, so
+	sta	arithStack-2,x
+	lda	RegC+1
+	sta	arithStack-1,x
+
+	lda	num		; Check/Fix sign
+	bmi	NegA
+	rts
+
+
+RemDiv: ; ( dividend.loword divisor -- quotient RegC=remainder )
+  ; Divide, generating quotient & remainder
+  ; Results are not sign corrected.
+  ; Algorithm is naive, but works well. Faster ones are out there...
+
+	jsr fixSigns		; Check signs and make positive
+
+	ldx ArithIndex
+
+	lda arithStack-2,x	; Check for divide by 0
+	ora arithStack-1,x
+	bne @OK
+	lda #eDIV0
+	jmp progErr
+@OK:
+
+	lda #0			; RegC is dividend.hiword and remainder
+	sta RegC+0
+	sta RegC+1
+
+	clc
+	ldy #16			; for 16 bits
+@Loop:
+	rol arithStack-4,x	;   Shift quotient & dividend
+	rol arithStack-3,x
+	rol RegC+0
+	rol RegC+1
+
+	sec
+	lda RegC+0		;   try dividend.hi - divisor
+	sbc arithStack-2,x
+	sta temp0
+	lda RegC+1
+	sbc arithStack-1,x
+	bcc @div2		;   if divisor fits
+	sta RegC+1		;     commit the subtract
+	lda temp0
+	sta RegC+0
+@div2:
+	dey			;  next bit
+	bne @Loop
+
+	rol arithStack-4,x	; shift in final quotient bit
+	rol arithStack-3,x
+				; remainder is in RegC
+	jmp DropX		; drop divisor & return
+
+
+getRnd: ; ( -- n ) Return the next pseudo random number
+
+	clc
+	lda	#17		; Any odd value
+	adc	PrngState+0
+	sta	PrngState+0
+	adc	PrngState+1
+	sta	PrngState+1
+
+	asl a
+	adc PrngState+0
+	and #$7f		; make positive
+	tay
+	eor PrngState+0
+	jmp PushYA		; Push into stack & return
+
+
+seedRnd: ; ( n -- ) Seed the PRNG..
+	; Seed is also modified in the getChar routine
+	jsr PopYA
+	sta PrngState+0
+	sty PrngState+1
+	rts
+
+
+getCC: ; ( -- n ) Return 65816S simulator cycle counter hi word
+	ldx ArithIndex
+	.byte $02,$f4,arithStack ;cop; get simulator cycle count dword at dir,x
+	inx
+	inx
+	stx ArithIndex
+	rts
+
+;* relationals.h: ================================================================
+
+;* relationals.s: ================================================================
+
+NEQ: ; ( n1 n2 -- f ) Not equal
+	jsr multiCmp
+	bne true2
+	beq false2
+
+EQ: ; ( n1 n2 -- f ) Equal to
+	jsr multiCmp
+	beq true2
+	bne false2
+
+LSS: ; ( n1 n2 -- f )  Less than
+	jsr multiCmp
+LSS3:	bmi true2
+	bpl false2
+
+GEQ:  ; ( n1 n2 -- f ) Greater than or equal
+	jsr multiCmp
+GEQ3:	bpl true2
+	bmi false2
+
+LEQ:  ; ( n1 n2 -- f ) Less than or equal to
+	jsr multiCmp
+	bne LSS3
+	beq true2
+
+GTR:  ; ( n1 n2 -- f ) Greater than
+	jsr multiCmp
+	bne GEQ3
+	beq false2
+
+
+false2: ; ( n1 n2 -- false ) return false
+	lda #0
+	beq true2b
+
+true2: ; ( n1 n2 -- true ) return true
+	lda #1
+true2b:	sta arithStack-4,x	; replace NOS with result
+	lda #0
+	sta arithStack-3,x
+
+	jmp DropX		; drop TOS & return
+
+
+multiCmp: ; ( n1 n2 -- n1 n2 cpu_flags ) compare top 2 arith stack entries
+	; Set CPU flags N & Z & C
+
+	ldx ArithIndex		; Get arith stack index
+
+	sec			; compare hi byte
+	lda arithStack-3,x
+	sbc arithStack-1,x
+	bvs @7
+	bne @9
+	lda arithStack-4,x	; compare lo byte
+	cmp arithStack-2,x
+	beq @9
+	ror a
+@7:	eor #$80
+	ora #1
+@9:	rts
+
+
+;* editor.h: =====================================================================
+
+;* editor.s: =====================================================================
+
+editor:  ; Insert/Replace/Delete a line in the program text.
+;
+; Pointer to line buffer is in svCursor.
+; Cursor points to the insertion point in the text.
+;
+; Each line is stored in the following format:
+;    Two bytes containing the line number (in binary, high byte first)
+;    One byte containing the length.
+;    The line text itself terminated by a CR.
+;    The last line is followed by $FF
+
+	lda	RegA+0		; Copy line number out of RegA into CurLineNum
+	sta	CurLineNum+0
+	lda	RegA+1
+	sta	CurLineNum+1
+
+; Get line length
+
+	ldx	#4			; Start at 4 - line number, len, CR
+	ldy	#0
+:	lda	(svCursor),y
+	cmp	#$0D
+	beq	:+
+	inx
+	iny
+	bne	:-
+:
+
+; If length is 4 and not an exact match from FLBL above, then we can return
+;	(Trying to delete a non-existant line)
+
+	cpx	#4
+	bne	@notEmptyLine
+
+; OK. Length is 4. Was it an exact match?
+
+	lda	findlFlag
+	bpl	@exact4
+
+; Not an exact match, so trying to delete a non-existant line, so...
+
+	rts		
+
+; It's a zero length line that exists, so ...
+
+@exact4 = deleteLine
+
+; Line length not 4, so...
+
+@notEmptyLine:
+	lda	findlFlag		; If line does not exists then we insert new, else ...
+	bmi	insertNew
+	jsr	deleteLine
+	; ... and fall into insert
+
+;********************************************************************************
+insertNew:  ; Insert a new line
+
+; Make space for the new line
+
+; Cursor points to the first byte of RAM to use
+
+	stx RegC+0		; save line length
+
+	lda Top+0		; RegB = Top
+	sta RegB+0
+	clc			; Top += length
+	adc RegC+0
+	sta Top+0
+	lda Top+1
+	sta RegB+1
+	adc #0
+	sta Top+1
+	bne @Next
+
+@decs:
+	lda RegB+0		; RegB--
+	bne :+
+	dec RegB+1
+:	dec RegB+0
+
+@Next:	ldy #0			; move a byte up
+	lda (RegB),y
+	ldy RegC+0
+	sta (RegB),y
+
+	lda RegB+0		; until RegB==Cursor
+	cmp Cursor+0
+	bne @decs
+	lda RegB+1
+	cmp Cursor+1
+	bne @decs
+
+; Now, copy the line into @Cursor ...
+; Copy line number and length
+;	Remember - line number is stored HIGH byte first.
+
+	ldy	#0
+	lda	CurLineNum+1
+	sta	(Cursor),y
+	iny
+	lda	CurLineNum+0
+	sta	(Cursor),y
+	iny
+	txa			; Length
+	sta	(Cursor),y
+
+; Optimise - copy until CR?
+	dex			; Remove the +4 we started with
+	dex
+	dex
+	dex
+
+	lda #3			; Adjust Cursor so we have a zero index
+	jsr BumpCursorA
+
+	ldy	#0
+:	lda	(svCursor),y	; Input
+	sta	(Cursor),y	; Store
+	iny
+	dex
+	bpl	:-
+
+	rts
+
+;********************************************************************************
+deleteLine:  ; Delete the line at the Cursor...
+	; Move from Cursor+len to Cursor until we hit the FF
+
+	lda Cursor+0		; RegB = Cursor
+	sta Top+0
+	lda Cursor+1
+	sta Top+1
+
+	ldy #2			; RegC = line length
+	lda (Cursor),y
+	sta RegC+0
+
+@Loop:	ldy RegC+0		; copy a byte down
+	lda (Top),y
+	ldy #0
+	sta (Top),y
+	cmp #$FF		; at end-of-program?
+	beq @Done
+
+	inc Top+0		; next
+	bne @Loop
+	inc Top+1
+	bne @Loop
+
+@Done:	rts			; and we're done
+
+
+;* error.h: ======================================================================
+
+; Error codes:
+eSTMT	=   0
+eCHAR	=   1
+eSNTX	=   2
+eVALU	=   3
+eEND	=   4
+eNOGO	=   5
+eRTRN	=   6
+eNEST	=   7
+eNEXT	=   8
+eFOR	=   9
+eDIV0	=  10
+eBRK	=  11
+eUNTL	=  12
+eARITH	=  13
+
+;* error.s: ======================================================================
+
+errorMsgs:
+	strTop	"STMT"		;   0
+	strTop	"CHAR"		;   1
+	strTop	"SNTX"		;   2
+	strTop	"VALU"		;   3
+	strTop	"END"		;   4
+	strTop	"NOGO"		;   5
+	strTop	"RTRN"		;   6
+	strTop	"NEST"		;   7
+	strTop	"NEXT"		;   8
+	strTop	"FOR"		;   9
+	strTop	"DIV0"		;  10
+	strTop	"BRK"		;  11
+	strTop	"UNTL"		;  12
+	strTop	"ARITH"		;  13
+
+syntaxErr: ; for syntax error
+	lda	#eSNTX
+
+progErr: ; with error code in A
+	pha			; Temp. save
+	tay
+	jsr	newLine
+
+	lda Cursor+1		; debug: print cursor
+	jsr oHex8
+	lda Cursor+0
+	jsr oHex8
+
+; Search the messages
+
+	ldx	#0
+@next0:	dey
+	bmi	@prError
+
+; Scan to the next one
+
+:	lda	errorMsgs,x
+	bmi	@next1
+	inx
+	bne	:-
+@next1:	inx			; Skip over the last char of the last message
+	bne	@next0
+
+; Print
+
+@prError:
+	lda	errorMsgs,x
+	bmi	@done
+	jsr	putChar
+	inx
+	bne	@prError
+@done:
+	and	#$7F		; Strip top bit on last character
+	jsr	putChar
+
+	pla			; Print " ERROR" unless BRK...
+	cmp	#eBRK
+	beq	@skipErr
+
+	jsr	putStr
+	.asciiz	" ERROR"
+@skipErr:
+
+	lda	runMod		; Test run/immediate mode
+	beq	:+
+
+	jsr	putStr
+	.asciiz	" AT "
+
+	lda	CurLineNum+0
+	sta	RegA+0
+	lda	CurLineNum+1
+	sta	RegA+1
+	jsr	pDec
+
+:	jmp	progFin		; tidy up
+
+
+;* findLine.h: ===================================================================
+
+;* findLine.s: ===================================================================
+
+;********************************************************************************
+findLine:  ; Search the program space for a line number stored on expr stack.
+  ; Set the Cursor to the address in the program whos line is > or = to
+  ; the one we're searching for.
+  ; Set the top-bit of findFlag if exact line is NOT found.
+  ;
+  ; Note: Program line numbers are stored High byte first!
+
+	jsr PopToRegA
+	jsr resetCursor		; Set Cursor to start of text
+	jmp @test
+
+@lower: ; move to the next line
+	ldy #2			; Get line length byte
+	lda (Cursor),y
+	clc			; jsr BumpCursorA
+	adc Cursor+0
+	sta Cursor+0
+	bcc @test
+	inc Cursor+1
+
+@test:	ldy #0			; get hi byte of line number
+	lda (Cursor),y
+;	bmi @higher		; Line numbers are positive and last byte of program is $FF
+	cmp RegA+1
+	bne @3
+	iny			; get lo byte of line number
+	lda (Cursor),y
+	cmp RegA+0
+@3:	bcc @lower
+	bne @higher
+
+; We have an exact match, 
+	lda #0			; Set exact match flag and return
+@saveFlag:
+	sta findlFlag
+	rts
+
+@higher: ; Inexact match:
+	lda #$80		; Set flag bit and return
+	bne @saveFlag
+
+
+;* flow.h: =======================================================================
+
+;* flow.s: =======================================================================
+
+;********************************************************************************
+.proc stmtDone  ; Check current statement finished.
+	; Moves the Cursor over any trailing spaces and stops at a colon or CR.
+	; Error if no colon or CR.
+
+	jsr SkipSpaces		; skip trailing spaces
+	cmp	#$0D		; CR?
+	beq	doneCR
+	cmp	#':'		; Colon?
+	beq	doneCLN
+
+	lda	#eCHAR		; something unexpected!
+	jmp	progErr
+
+
+doneCLN:			; Skip over the colon
+	incCursor
+doneCR:				; ... but we leave the Cursor on the CR for stmtNext
+	rts
+.endproc
+
+
+;********************************************************************************
+.proc stmtNext  ; move to next statement
+	; (Not FOR/NEXT)
+
+	lda	runMod		; running?
+	beq	progFin
+
+	ldy	#0
+	lda	(Cursor),y
+	cmp	#$0D		; if at end of the line
+	bne	L9
+
+	iny			; Skip over the CR
+	lda	(Cursor),y	; Get Line number High
+	bmi	progFin		; at end of pgm?
+	sta	CurLineNum+1	; Store in the line number
+	iny
+	lda	(Cursor),y	; Get line number low
+	sta	CurLineNum+0
+
+	bumpCursor 4		; Add 4 to the Cursor - skips over the CR/lineNum/Len
+
+L9:
+	jmp ilStatement		; to next statement handler
+.endproc
+
+
+;********************************************************************************
+.proc	progFin  ; Finish execution
+
+	lda	#0
+	sta	runMod		; Not running
+
+;	pla			; drop rts addr
+;	pla
+	jmp ilStart		; Set I.L. PC to ilStart
+.endproc
+
+;********************************************************************************
+.proc progStart  ; Start execution
+
+	jsr	resetCursor
+
+; Store initial line number
+;	Remember, it's stored high byte first as the top-bit set indicates
+;	end of program text.
+
+	ldy	#0		; Get line # hi byte
+	lda	(Cursor),y
+	bmi	progFin		; end of program?
+	sta	CurLineNum+1
+	iny			; get line # lo byte
+	lda	(Cursor),y
+	sta	CurLineNum+0
+
+	sty	runMod		; Run mode = 1
+
+	bumpCursor 3		; Line number + length byte
+
+	rts
+.endproc
+
+
+;* goto.h: =======================================================================
+
+;* goto.s: =======================================================================
+
+;********************************************************************************
+.proc doGoto  ; Is GOTO. also used for GOSUB.
+;    We enter here with the Cursor pointing at the start of the stored
+;    line-number of the target - high byte first.
+
+	jsr	CheckKbdInt
+
+	lda	findlFlag		; Did we find the line?
+	bmi	noGo
+
+; Emulate a bit of stmtNext here...
+
+	ldy	#0			; get line # hi byte
+	lda	(Cursor),y
+	sta	CurLineNum+1
+	iny
+	sty	runMod			; Set runMod to running
+	lda	(Cursor),y		; get line # lo byte
+	sta	CurLineNum+0
+
+	bumpCursor 3			; Line number + length byte
+
+	pla				; drop rts addr
+	pla
+	jmp ilStatement			; Point I.L. to the next ilStatement handler
+
+noGo: ; line not found
+	lda	#eNOGO
+	jmp	progErr
+.endproc
+
+;********************************************************************************
+.proc	saveDo ; Save the Cursor into the DO stack
+
+	ldx	DoIndex
+	cpx	#doStackSize
+	beq	@tooDeep
+
+	lda	Cursor+0		; Push low first
+	sta	doStack,x
+	inx
+	lda	Cursor+1
+	sta	doStack,x
+	inx
+	stx	DoIndex
+	rts
+
+@tooDeep:
+	lda	eNEST
+	jmp	progErr
+.endproc
+
+
+;********************************************************************************
+.proc until  ; The working part of the DO loop construct
+
+	jsr	CheckKbdInt
+
+	ldx	DoIndex		; Get and check the do stack pointer
+	beq	@noUntil
+
+	lda	RegA+0		; Check expression for zero.
+	ora	RegA+1
+	bne	@done		; 0 = FALSE => Re-Do the loop
+
+@continue:
+	lda	doStack-1,x	; branch back
+	sta	Cursor+1
+	lda	doStack-2,x
+	sta	Cursor+0
+				; fix CurLineNum???
+	rts
+
+@done:	dex			; drop Do entry
+	dex
+	stx	DoIndex
+	rts
+
+@noUntil:
+	lda	#eUNTL
+	jmp	progErr
+.endproc
+
+
+;********************************************************************************
+.proc	saveSub ; Save return address for GOSUB
+
+	ldx	GosubIndex
+	cpx	#GosubStackSize	; Don't overflow...
+	bcs	@tooDeep
+
+	lda	Cursor+0	; Push low first
+	sta	GosubStack,x
+	inx
+
+	lda	Cursor+1
+	ldy	runMod		; Check run/edit
+	bne	@3
+	lda	#$FF		; Push $FF if in immediate mode so return can sense it
+@3:	sta	GosubStack,x
+	inx
+	stx	GosubIndex
+	rts
+
+
+@tooDeep:
+	lda	#eNEST
+	jmp	progErr
+.endproc
+
+;********************************************************************************
+.proc returnSub ; Return from subrutine
+
+	ldx	GosubIndex	; Get and check the gosub stack pointer
+	beq	@noSub
+	dex
+	dex
+
+	lda	GosubStack+0,x	; Get top of stack into Cursor
+	sta	Cursor+0
+	lda	GosubStack+1,x
+	sta	Cursor+1
+	stx	GosubIndex
+; Seems like CurLineNum should be updated here?
+
+	bmi	@retInt		; interactive mode?
+	rts
+
+@retInt:
+	lda	#0
+	sta	runMod		; Make sure we're in interactive mode
+	rts
+
+@noSub:
+	lda	#eRTRN
+	jmp	progErr
+
+.endproc
+
+;********************************************************************************
+saveFor: ; Create a new FOR instance
+
+	ldy	ForIndex
+	cpy	#forStackSize	; Don't overflow...
+	beq	@tooDeep
+
+; Pull data off the arithmetic stack and push it into the FOR stack.
+
+	ldx	ArithIndex
+
+	lda	arithStack-7,x		; Variable index
+	sta	forStack+0,y
+
+	lda	arithStack-4,x		; Limit L
+	sta	forStack+1,y
+
+	lda	arithStack-3,x		; Limit H
+	sta	forStack+2,y
+
+	lda	arithStack-2,x		; Step L
+	sta	forStack+3,y
+
+	lda	arithStack-1,x		; Step H
+	sta	forStack+4,y
+
+	lda	Cursor+0		; Cursor location
+	sta	forStack+5,y
+	lda	Cursor+1
+	sta	forStack+6,y
+
+	tya
+	clc
+	adc #7
+	sta ForIndex
+
+; We leave the variable index and value on the ArithStack so it can be used by the > op.
+
+	jmp DDropX			; Drop step & limit, & return
+
+
+@tooDeep:
+	lda	#eNEST
+	jmp	progErr
+
+; .align 32
+;********************************************************************************
+nextV:  ; do NEXT statement
+
+	jsr CheckKbdInt
+
+	ldy ForIndex
+	beq @noNext
+
+	ldx ArithIndex
+	lda arithStack-1,x		; Get variable index
+	cmp forStack-7,y		; Make sure the same as in the forStack
+	bne @noFor
+	dec ArithIndex			; Drop variable index
+
+; Add step to variable and store back into variable
+
+	tax				; Variable index into X
+
+	clc
+	lda	forStack-4,y		; Low byte of step
+	adc	variablesL,x		; Add to variable
+	sta	variablesL,x
+	lda	forStack-3,y		; High byte
+	adc	variablesH,x		; Add to variable
+	sta	variablesH,x
+
+	; compare variable & limit
+	sec			; compare hi byte
+	lda variablesH,x
+	sbc forStack-5,y
+	bvs @C7
+	bne @CNe
+	lda variablesL,x	; compare lo byte
+	cmp forStack-6,y
+	beq @Loop
+	ror a
+@C7:	eor #$80
+@CNe:	eor forStack-3,y	; choose compare depending on sign of step
+	bpl @done
+
+@Loop: ; loop again
+	lda forStack-1,y	; Get old Cursor off FOR stack
+	sta Cursor+1
+	lda forStack-2,y
+	sta Cursor+0
+	rts
+
+@done: ; exit the loop
+	tya
+	sec
+	sbc #7			; Pop FOR stack
+	sta ForIndex
+
+	rts
+
+@noNext:
+	lda	#eNEXT
+	jmp	progErr
+
+@noFor:
+	lda	#eFOR
+	jmp	progErr
+
+; .align 32
+;********************************************************************************
+doIF: ; The test part of the IF statement - test for zero
+
+	lda	RegA+0
+	ora	RegA+1
+	beq	@fail		; Zero is false...
+	rts
+
+; Fail: Skip to the end of the line, but ...
+;	... note that we stop short and leave the CR to
+;	    stmtDone/stmtNext to deal with
+
+@fail0:
+	incCursor
+@fail:
+	lda	(Cursor),y
+	cmp	#$0D
+	bne	@fail0
+
+	pla			; Drop the rts addr
+	pla
+	jmp	stmtNext	; return via stmtNxt
+
+; .align 32
+; il.h: =========================================================================
+; The IL - Intemediate Language is a sort of virtual machine that enabled
+; the original Tiny Basic to save a lot of space. It's implemented by a
+; a set of macros to define the actual commands.
+
+
+; Macros to compile IL instructions:
+
+ ; SkipSpaces sets up inputs for the following compare macros.
+
+ .macro LoadCursorYA  ; reload A=char at Cursor, Y=0
+  ; Useful for setting up inputs for compare macros if Cursor doesn't need to be moved.
+	ldy #0
+	lda (Cursor),y
+	.endmacro
+
+.macro tStr fail,str ; Try to match the BASIC text (Cursor) with inline pattern.
+  ; Input: Cursor=ptr to next non-blank char, A=(Cursor), Y=0
+  ; Output on nomatch: same as input
+  ; Output on match: match string consumed
+	cmp #.strat(str,0)	; 1st char match?
+	bne fail
+    .if .strlen(str)=1
+	jsr testStr1		; do match
+     .else
+	jsr testStr		; check further, >1 char version
+	.repeat .strlen(str)-2,I ; 2nd thru last-1
+	  .byte .strat(str,I+1)
+	 .endrep
+	.byte .strat(str,.strlen(str)-1) | $80	; The last character
+     .endif
+  .endmacro
+
+.macro testCR fail ; Try to match the BASIC text at (Cursor) with a CR.
+  ; Input: Cursor=ptr to next non-blank char, A=(Cursor), Y=0
+  ; Output on nomatch: same as input
+  ; Output on match: match string consumed
+	cmp #$0d
+	bne fail
+	jsr testStr1		; do match
+  .endmacro
+
+.macro tVar fail ; Try to match the BASIC text at (Cursor) as a variable name.
+  ; Input: Cursor=ptr to next non-blank char, A=(Cursor), Y=0
+  ; Output on nomatch: same as input
+  ; Output on match: match string consumed
+	jsr testVar
+	beq fail
+  .endmacro
+
+.macro tNum fail ; Try to match the BASIC text at (Cursor) as a decimal number.
+  ; Input: Cursor=ptr to next non-blank char, A=(Cursor), Y=0
+  ; Output on nomatch: same as input
+  ; Output on match: match string consumed
+	cmp #'9'+1		; starts with a digit?
+	bcs fail
+	cmp #'0'
+	bcc fail
+	jsr testNum		; check further
+  .endmacro
+
+.macro jump addr ; Jumps to a new IL command
+	jmp addr
+  .endmacro
+
+.macro call addr ; Calls an IL subroutine
+	jsr addr
+  .endmacro
+
+.macro do a1,a2,a3,a4,a5,a6,a7 ; Calls a sequence of ML subroutines one after the other
+	jsr a1
+	.ifnblank a2
+	  do a2,a3,a4,a5,a6,a7
+	 .endif
+  .endmacro
+
+
+; il.s: =========================================================================
+
+	.feature	string_escapes 
+
+
+;********************************************************************************
+;* The I.L. program.
+;*	Based on the NIBL one with many tweaks by Gordon.
+
+ilBegin: ; startup
+		tsx			; remember where empty return stack is
+		stx RStack0
+
+		do	clear,newProg
+		; And fall into ...
+ 
+ilStart: ; Start of the interpreter loop. This is interactive mode
+
+		ldx RStack0		; initialise the stacks
+		txs
+
+		do	newLine
+prompt:		do	doGetLine
+		do SkipSpaces
+		testCR	prmpt1				; Empty line?
+		jump	prompt				; ... loop back if-so.
+
+prmpt1:		tNum	@tryList			; Line start with a number?
+		do	saveCursor,findLine,editor	; ... Insert the line
+		jump	prompt
+
+; Now check for interactive commands
+
+@tryList:	tStr	@tryRun,	"LIST"		; List entire program.
+		do	resetCursor
+		do	listProg
+		jump	ilStart
+
+@tryRun:	tStr	@tryClear,	"RUN"		; Run a program
+		do	clear,progStart
+		jump	ilStatement
+
+@tryClear:	tStr	@tryNew,	"CLEAR"		; Clear variables, etc.
+		do	stmtDone,clear
+		jmp stmtNext
+
+@tryNew:	tStr	ilStatement,	"NEW"		; Newk it all
+		do	newProg
+		jmp stmtNext
+
+ilStatement: ; Program statements - interactive or command
+
+		lda ArithIndex		; should be empty
+		beq :+
+		lda #eARITH
+		jsr progErr
+:
+
+		tsx			 ; check for return stack overflow
+		cpx $80
+		bcs @RtnOk
+		lda #eNEST
+		jmp progErr
+@RtnOk:
+
+		do SkipSpaces
+
+		tStr	@tryLet,	"LET"		; Optional LET
+@tryLet:	tVar	@tryPokeByte			; If not a variable then carry on
+		tStr	synErr2,"="			; ... else variable assignment.
+		call	relExp
+		do	storeV,stmtDone
+		jmp stmtNext
+
+@tryPokeByte:	tStr	@tryPokeWord,	"?"
+		call	factor
+		tStr	synErr2,"="
+		call	relExp
+		do	pokeByte,stmtDone
+		jmp stmtNext
+
+@tryPokeWord:	tStr	tryIF,		"!"
+		call	factor
+		tStr	synErr2,"="
+		call	relExp
+		do	pokeWord,stmtDone
+		jmp stmtNext
+
+synErr2:	jmp synErr
+
+tryIF:		tStr	tryUntil,	"IF"
+		call	relExp
+		tStr	tryIf1,		"THEN"			; Optional THEN
+tryIf1:		do	PopToRegA,doIF
+		jump	ilStatement
+
+tryUntil:	tStr	tryDo,		"UNTIL"
+		do	runMode					; Run-time only
+		call	relExp
+		do	stmtDone,PopToRegA,until
+		jmp stmtNext
+
+tryDo:		tStr	tryGoto,	"DO"
+		do	runMode,stmtDone,saveDo
+		jmp stmtNext
+
+tryGoto:	tStr	tryReturn,	"GO"			; Start looking for GO
+		tStr	tryGosub,	"TO"			; ... then TO or 
+		call	relExp
+		do	stmtDone
+		jump	gosCmn
+
+synErr5:	jmp synErr
+
+tryGosub:	tStr	synErr5,	"SUB"			; ... SUB
+		call	relExp
+		do	stmtDone,saveSub
+
+gosCmn:	; common code for GOTO and GOSUB
+		do	findLine,doGoto
+;		jmp stmtNext
+
+tryReturn:	tStr	tryNext,	"RETURN"		; Return from subroutine
+		do	stmtDone,returnSub
+		jmp stmtNext
+
+tryNext:	tStr	tryFor,		"NEXT"			; Setup NEXT statement
+		do	runMode					; ... Only when running
+		tVar	synErr4					; Need a variable: NEXT I
+		do	stmtDone,nextV				; First part of NEXT
+		jmp stmtNext
+
+
+tryFor:		tStr	trySetRnd,	"FOR"			; Setup for the FOR loop
+		do	runMode					; ... Only when running
+		tVar	synErr4					; Start
+		tStr	synErr4,"="				; =
+		call	relExp					; Value
+		tStr	synErr4,"TO"				; TO
+		call	relExp					; Limit
+		tStr	forStep1,	"STEP"			; STEP - if not preset then ...
+		call	relExp
+		jump	tryFor2
+
+synErr4:	jmp synErr
+
+forStep1:	do	push1					; ... load 1
+tryFor2:	do	stmtDone,saveFor,storeV
+		jmp stmtNext
+
+trySetRnd:	tStr	tryDollar,	"RND"			; RND = ... Seed the PRNG
+		tStr	synErr4,	"="
+		call	relExp
+		do	stmtDone,seedRnd
+		jmp stmtNext
+
+tryDollar:	tStr	tryPrint,	"$"			; $ factor = "string" ...
+		call	factor
+		tStr	synErr4,	"="
+		tStr	tryDollar1,	"\""
+		do	PopToRegA,putString
+		jump	tryDollar2
+
+tryDollar1:	tStr	synErr4,	"$"			; ... or = $ factor
+		call	factor
+		do	moveString
+tryDollar2:	do	stmtDone
+		jmp stmtNext
+
+tryPrint: ; Printing stuff
+
+		tStr	@tryVDU,	"PR"			; PRINT can be shortened to PR
+		tStr	@tryPrint1,	"INT"
+@tryPrint1:
+		tStr	@tryPrint2,	"\""			; String literal?
+		do	pStringP
+		jump	@prComma
+
+@tryPrint2:	tStr	@tryPrint3,	"$"			; $ factor (string ptr)?
+		call	factor
+		do	PopToRegA,pStringV
+		jump	@prComma
+
+@tryPrint3:	tStr	@tryPrint4,	"~"			; Print as Hex?
+		call	relExp
+		do	PopToRegA,pHex
+		jump	@prComma
+
+@tryPrint4:	call	relExp					; Printing as decimal
+		do	PopToRegA,pDec
+
+@prComma:	do SkipSpaces
+		tStr	@tryPrint5,	","			; Comma separates items
+		jump	@tryPrint1				; Keep going
+
+@tryPrint5:	tStr	@tryPrint6,	";"			; Semicolon only at end
+		jump	@printDone
+
+@tryPrint6:	do	newLine
+@printDone:	do	stmtDone
+		jmp stmtNext
+
+@tryVDU:	tStr	@tryInput,	"VDU"
+@tryVDU1:	call	relExp
+		do	DoVdu
+		do SkipSpaces
+		tStr	@vduDone,	","
+		jump	@tryVDU1
+
+@vduDone:	do	stmtDone
+		jmp stmtNext
+
+@tryInput: ; Input stuff
+  ;	Single variable at a time input
+
+		tStr	@tryEnd,	"INPUT"
+		do	runMode					; Only in run mode.
+		tVar	@tryInput2				; Ordinary variable?
+		do	saveCursor
+@tryInput0:	do	doGetLine
+		do SkipSpaces
+		testCR	@tryInput1
+		jump	@tryInput0
+
+@tryInput1:	call	relExp
+		do	storeV,restoreCursor,stmtDone
+		jmp stmtNext
+
+@tryInput2:	tStr	synErr,		"$"			; String variable?
+		call	factor
+		do	saveCursor,doGetLine,PopToRegA,iString,restoreCursor,stmtDone
+		jmp stmtNext
+
+@tryEnd:	tStr	@tryCall,	"END"
+		do	stmtDone,progFin
+
+@tryCall:	tStr	@tryRem,	"CALL"
+		call	factor
+		do	PopToRegA,callML,stmtDone
+		jmp stmtNext 
+
+@tryRem:	tStr	synErr,		"REM"			; Remarkable
+		do	comment
+		jmp stmtNext
+
+synErr:		do	syntaxErr				; Doesn't return
+
+
+relExp: ; Relational operators - compares.
+  ; Returns with Cursor updated, A=char at Cursor, Y=0, result on arithStack
+
+		call	expr		; Evaluate expression
+
+		tStr	@rel1,	"="
+		call	expr
+		jsr	EQ
+		jmp @end
+
+@rel1:		tStr	@rel4,	"<"
+		tStr	@rel2,	"="
+		call	expr
+		jsr	LEQ
+		jmp @end
+
+@rel2:		tStr	@rel3,	">"
+		call	expr
+		jsr	NEQ
+		jmp @end
+
+@rel3:		call	expr
+		jsr	LSS
+		jmp @end
+
+@rel4:		tStr	@end2,	">"
+		tStr	@rel5,	"="
+		call	expr
+		jsr	GEQ
+		jmp @end
+
+@rel5:		call	expr
+		jsr	GTR
+
+@end:		LoadCursorYA		; reload char at Cursor
+@end2:		rts
+
+
+expr: ;	Arithmetic expressions
+  ; Returns with Cursor updated, A=char at Cursor, Y=0, result on arithStack
+		LoadCursorYA
+		tStr	@EX1,	"-"
+		call	term
+		do	Negate
+		jump	@EX3
+
+@EX1:		tStr	@EX2,	"+"
+@EX2:		call	term
+@EX3:		LoadCursorYA
+		tStr	@EX4,	"+"
+		call	term
+		do	ADD
+		jump	@EX3
+
+@EX4:		tStr	@EX5,	"-"
+		call	term
+		do	SUB
+		jump	@EX3
+
+@EX5:		tStr	@ret,	"OR"
+		call	term
+		do	orOP
+		jump	@EX3
+
+@ret:		rts
+
+
+term:  ; ? higher precidence expressions
+  ; Returns with Cursor updated, A=char at Cursor, Y=0, result on arithStack
+		call	factor
+@t1:		LoadCursorYA
+
+		tStr	@t2,	"*"
+		call	factor
+		do	MUL
+		jump	@t1
+
+@t2:		tStr	@t3,	"/"
+		call	factor
+		do	DIV 
+		jump	@t1
+
+@t3:		tStr	@t4,	"%"
+		call	factor
+		do	MOD
+		jump @t1
+
+@t4:		tStr	@ret,	"AND"
+		call	factor
+		do	andOP
+		jump	@t1
+
+@ret:		rts
+
+
+factor: ; Moves a value to the stack - variable, constant, system variable, etc.
+	; May be called recursively.
+  ; Returns with Cursor updated, A=char at Cursor, Y=0, result on arithStack
+		LoadCursorYA
+
+		tNum	@tryVar			; decimal number?
+		rts
+
+@tryVar:	tVar	@tryHexNum		; variable?
+		jsr	loadV
+		jmp @ret
+
+@tryHexNum:	tStr	@tryParen,	"&"	; Hex?
+		jsr	getHex
+		jmp @ret
+
+@tryParen:	tStr	@tryPeekB,	"("	; Brackets?
+		call	relExp
+		tStr	synErr3,	")"	; Must match...
+		rts
+
+@tryPeekB:	tStr	@tryPeekW,	"?"
+		call	factor
+		jsr	peekByte
+		jmp @ret
+
+@tryPeekW:	tStr	@tryNot,	"!"
+		call	factor
+		jsr	peekWord
+		jmp @ret
+
+@tryNot:	tStr	@tryGetChar,	"NOT"
+		call	factor
+		jsr	notOP
+		jmp @ret
+
+@tryGetChar:	tStr	@tryGetTop,	"GET"	; Get single character from keyboard
+		jsr	doGetChar
+		jmp @ret
+
+@tryGetTop:	tStr @tryGetCc, "TOP"		; Get start of free RAM
+		jsr getTop
+		jmp @ret
+
+@tryGetCc:	tStr @tryGetRnd, "CC@/64K"	; get simulator cycle counter/64k
+		jsr getCC
+		jmp @ret
+
+@tryGetRnd:	tStr synErr3, "RND"	; Get random number
+		jsr getRnd
+;		jmp @ret
+
+@ret:		LoadCursorYA		; reload
+		rts
+
+synErr3:	jmp synErr
+
+
+;* ilExec.h: =====================================================================
+
+;* ilExec.s: =====================================================================
+
+
+; .align 32
+testStr: ; Inline string compare >1 char with (Cursor) .
+  ; 1st char of string has been matched inline.
+  ; remainder of chars are in-line.
+  ; Input: A=1st_char, Y=0, cursor=point_at_1st_char
+	pla
+	sta Temp+0
+	pla
+	sta Temp+1
+
+@Loop:	iny
+	lda (Temp),y
+	bmi @Last
+	cmp (Cursor),y
+	beq @Loop		; Match failed?
+
+@Fail:	sec			; rts to inline bne fail
+	lda Temp+0
+	sbc #5
+	tay
+	lda Temp+1
+	sbc #0
+	pha
+	tya
+	pha
+
+	ldy #0			; reload A & Y for following tests
+	lda (Cursor),y
+;	ldx #1			; p.Z=0 (do bne fail)
+	rts
+
+@Last: ; last char to check
+	and #$7f
+	cmp (Cursor),y
+	bne @Fail
+	
+@Match:
+;	Means we fall-through to the next instruction which
+;	is after the inline string.
+
+	iny
+	tya
+	jsr BumpCursorA		; Adjust Cursor
+
+	dey
+	clc			; rts after the literal
+	tya
+	adc Temp+0
+	tay
+	lda Temp+1
+	adc #0
+	pha
+	tya
+	pha
+
+	bcc SkipSpaces
+
+
+; .align 32
+testStr1: ; special 1-char case of testStr
+  ; 1st & only char has been checked by inline code (see tStr)
+  ; Input: A=char
+	incCursor		; Skip over the 1-char string
+	cmp #'"'		; don't skip spaces after '"'
+	bne SkipSpaces
+	rts
+
+
+; .align 32
+SkipSpaces: ; Skips cursor over any spaces.
+  ; Leaves A=first non-space character, Y=0, p.Z=0
+	ldy #0
+@loop:	lda (Cursor),y
+	cmp #' '
+	bne @done
+	inc Cursor+0
+	bne @loop
+	inc Cursor+1
+	bne @loop
+@done:	rts
+
+
+; .align 32
+;********************************************************************************
+testVar: ; Test for a variable name in the text @ the Cursor.
+  ; If found, then put the index (0-25) on the arith stack,
+  ; else control passes to the fail address.
+  ; Input:cmd A=1st_char, Y=0
+ 	cmp #'@'		; Test for a Letter @-Z:
+	bcc @FailA
+	cmp #'Z'+1
+	bcs @FailA
+
+	tax			; Temp. store in X
+
+	iny			; 2nd char must not be a letter (might be a keyword)
+	lda (Cursor),y
+	cmp #'@'
+	bcc @OK
+	cmp #'Z'+1
+	bcc @FailX
+
+@OK: ; We have a variable.
+	incCursor		; Skip over the variable letter
+
+	txa			; Recover saved variable letter
+	and #$1F		; To yield index 0-25.
+
+	ldx ArithIndex		; Push on the stack
+	sta arithStack,x
+	inc ArithIndex
+
+	bne SkipSpaces		; also p.Z=0 (fall thru bne fail)
+
+
+@FailX:	txa			; reload 1st char
+@FailA:	ldy #0			; Y=0, p.Z=1 (do beq fail)
+	rts
+
+; .align 32
+;********************************************************************************
+testNum: ; tests for a number in the text @ the Cursor.
+  ; If no number is found, control passes to the fail address.
+  ; Otherwise, the number is scanned and put on the arithmetic
+  ; stack, with control passing to the next instruction.
+  ; Input: A=char at cursor, Y=0
+
+	; OK, we have a leading digit
+
+	tya			; init accum
+	jsr PushYA
+
+	lda (Cursor),y		; reload char
+
+@nextDigit:
+	and #$0F		; We know it's ASCII digit
+	sta RegA
+
+; Multiply accum by 10 and add it in:
+
+	lda arithStack-2,x	; RegC=accum*2
+	asl a
+	sta RegC+0
+	lda arithStack-1,x
+	rol a
+	sta RegC+1
+	bmi @overflow
+	asl RegC+0		; RegC*=2
+	rol RegC+1
+	bmi @overflow
+
+;	clc			; accum+=RegC to get *5
+	lda arithStack-2,x
+	adc RegC+0
+	sta arithStack-2,x
+	lda arithStack-1,x
+	adc RegC+1
+	sta arithStack-1,x
+	bmi @overflow
+
+	asl arithStack-2,x	; accum*=2 to get *10
+	rol arithStack-1,x
+	bmi @overflow
+
+;	clc			; accum+= new_digit
+	lda RegA
+	adc arithStack-2,x
+	sta arithStack-2,x
+	bcc :+
+	inc arithStack-1,x
+	bmi @overflow
+:
+	incCursor		; Skip over digit just processed
+	lda (Cursor),y		; get next char
+	cmp #'0'
+	bcc @Done
+	cmp #'9'+1
+	bcc @nextDigit
+@Done:
+
+	jmp SkipSpaces	; also load A & Y & p.Z=0 (fall thru beq fail)
+
+@overflow:
+	lda	#eVALU
+	jmp	progErr
+
+
+;* ilUtils.h: ====================================================================
+
+;* ilUtils.s: ====================================================================
+
+
+clear: ; clear variables & stacks
+
+	lda #0			; clear all variables to zero
+	ldx #varSize0-1
+:	sta variablesL,x
+	sta variablesH,x
+	dex
+	bpl :-
+
+	sta	ArithIndex	; Arithmetic stack
+	sta	DoIndex		; DO stack
+	sta	GosubIndex	; GOSUB stack
+	sta	ForIndex	; FOR stack
+	sta	runMod		; not Running
+	rts
+
+;********************************************************************************
+storeV:  ; Store variable from stack to RAM.
+
+	ldx	ArithIndex
+	ldy	arithStack-3,x	; Get variable index
+	lda	arithStack-2,x	; Low byte
+	sta	variablesL,y
+	lda	arithStack-1,x	; High byte
+	sta	variablesH,y
+	dex			; Drop variable index
+	jmp DropX
+
+;********************************************************************************
+loadV:  ; ( index -- n )  Pops variable index, then fetches that variable and
+		; puts it on the stack.
+
+	ldx	ArithIndex
+	ldy	arithStack-1,x		; Get variable index
+	lda	variablesL,y
+	sta	arithStack-1,x
+	lda	variablesH,y
+	sta	arithStack-0,x
+	inc	ArithIndex
+	rts
+
+;********************************************************************************
+resetCursor:  ; Move Cursor (text pointer) to the start of the stored program
+	lda #<BasicStart	; Program text start location.
+	sta Cursor+0
+	lda #>BasicStart
+	sta Cursor+1
+	rts
+
+;********************************************************************************
+saveCursor:  ; Save the Cursor (text pointer) and restore it.
+	lda	Cursor+0
+	sta	svCursor+0
+	lda	Cursor+1
+	sta	svCursor+1
+	rts
+
+
+restoreCursor:
+	lda	svCursor+0
+	sta	Cursor+0
+	lda	svCursor+1
+	sta	Cursor+1
+	rts
+	
+;********************************************************************************
+PopToRegA:  ; Pop arithmetic expression stack into RegA
+	jsr PopYA
+	sty RegA+1
+	sta RegA+0
+	rts
+
+PopYA: ; pop arithmetic expression stack into YA
+	ldx ArithIndex
+	dex			; Points to hi
+	ldy arithStack,x
+	dex
+	lda arithStack,x
+	stx ArithIndex
+	rts
+
+;********************************************************************************
+push1:  ; Push 1 into the arithmetic stack
+		; (Used in FOR without a step)
+	lda #1
+	jmp PushZA
+
+;********************************************************************************
+newProg:  ; Clear current program
+
+	jsr	resetCursor
+
+	lda	#$FF		;store $FF at the start of the program area
+	ldy	#0
+	sta	(Cursor),y
+
+	lda	Cursor+0		; Set TOP to Cursor
+	sta	Top+0
+	lda	Cursor+1
+	sta	Top+1
+
+	rts
+
+;********************************************************************************
+
+pokeByte: ; ( address value -- )
+	; Move a byte to RAM/IO/etc. used in the ? and ! commands
+	; @stack [1] := stack [0]
+
+	ldx ArithIndex
+	lda arithStack-2,x		; A = lo byte of value
+	sta (arithStack-4,x)		; Poke it
+
+DDropX:	dex				; Drop value & address from stack
+	dex
+	dex
+	dex
+	stx ArithIndex
+	rts
+
+pokeWord: ; ( address value -- )
+	ldx ArithIndex
+	lda arithStack-2,x		; A = lo byte of value
+	sta (arithStack-4,x)		; Poke it
+
+	inc arithStack-4,x
+	bne :+
+	inc arithStack-3,x
+:
+	lda arithStack-1,x		; A = hi byte of value (for pokeWord)
+	sta (arithStack-4,x)
+	jmp DDropX
+
+
+;********************************************************************************
+;	Peek RAM - used in the ? and ! commands
+
+peekByte: ; ( addr -- n )
+	ldx ArithIndex
+	lda (arithStack-2,x)
+	sta arithStack-2,x
+	lda #0
+	sta arithStack-1,x
+	rts
+
+
+peekWord: ; ( addr -- n )
+	ldx ArithIndex
+	lda (arithStack-2,x)		; Get lo byte
+	tay
+	inc arithStack-2,x		; increment addr
+	bne :+
+	inc arithStack-1,x
+:
+	lda (arithStack-2,x)		; get hi byte
+	sta arithStack-1,x		; store
+	sty arithStack-2,x
+	rts
+
+;********************************************************************************
+.proc comment  ; skip over remainder of current line
+;	Note: Leave Cursor at char immediately before the CR as DONE/NXT will
+;	cater for that.
+
+	ldy	#0
+L0:	lda	(Cursor),y
+	cmp	#$0D
+	beq	:+
+	incCursor
+	bne	L0
+:	rts
+.endproc
+
+;********************************************************************************
+.proc getTop  ; Return TOP of RAM for the TOP keyword.
+;	However, the system TOP represents the last byte of the program, a $FF
+;	so we'll add 1 to it for BASIC programs so storing strings won't
+;	overwrite the $FF marker...
+
+	clc
+	lda	Top+0
+	adc	#1
+	ldy	Top+1
+	bcc :+
+	iny
+:	jmp PushYA
+.endproc
+
+;********************************************************************************
+getHex:  ; ( -- n )  Get hexadecimal number
+
+	ldy	#0
+	sty	RegB+0
+	sty	RegB+1
+	sty	num		; Count number of hex digits
+	beq	@next
+
+@store:
+	ldy	#4
+:	asl	RegB+0
+	rol	RegB+1
+	dey
+	bne	:-
+
+	ora	RegB+0
+	sta	RegB+0
+	
+	inc num			; count valid hex digit
+
+	incCursor		; get next char
+@next:	lda (Cursor),y
+	sec
+	sbc #'0'		; 0..9 ?
+	bcc @End
+	cmp #9+1
+	bcc @store
+
+	sbc #'A'-'0'-10		; A..F ?
+	cmp #10
+	bcc @End
+	cmp #15+1
+	bcc @store
+@End:
+	lda num			; any hex digits found?
+	beq @Err
+
+	lda RegB+0		; push result
+	ldy RegB+1
+	jsr PushYA
+
+	jmp SkipSpaces		; on to next
+
+@Err:	jmp syntaxErr
+
+;********************************************************************************
+.proc runMode  ; Cause an error if not in RUN mode
+  ; preserves A & Y if no error
+	ldx	runMod
+	beq	notRunning
+	rts
+notRunning:
+	lda	#eSTMT
+	jmp	progErr
+.endproc
+
+
+;********************************************************************************
+.proc callML  ; CALL factor
+;	Calls a machine language routine - address in hi/lo
+	jmp (RegA)
+.endproc
+
+
+;* input.h: ======================================================================
+
+;* input.s: ======================================================================
+
+;********************************************************************************
+doGetChar:  ; Get a single character from the keyboard and push it into the stack
+	jsr	getChar
+
+PushZA: ; push zero-extended A onto arith stack
+	ldy #0
+PushYA: ; push YA onto arith stack
+	ldx	ArithIndex		; alloc a cell
+	inx
+	inx
+	stx	ArithIndex
+	sta	arithStack-2,x		; Low byte
+	sty	arithStack-1,x		; High
+	rts
+
+;********************************************************************************
+.proc doGetLine  ; Prompt and read in a line of text.
+;	Returns with the Cursor set to the start address.
+
+	lda	#'>'		; Interactive prompt
+	ldy	runMod		; Check run/interactive mode:
+	beq	:+
+	lda	#'?'		; Running, so INPUT statement, so ? prompt
+:	jsr	getLine		; Call system getLine with prompt
+
+	lda	#<lineInput	; Set Cursor to start of input buffer
+	sta	Cursor+0
+	lda	#>lineInput
+	sta	Cursor+1
+
+	rts
+.endproc
+
+
+;* list.h: =======================================================================
+
+;* list.s: =======================================================================
+
+
+;********************************************************************************
+.proc listProg  ; List a program.
+;	Lists the entire program - no way to just list a line or 2 yet.
+
+	jsr	resetCursor
+
+; Force print width to 5 (Store 4 in the @ variable)
+
+	lda	#4
+	sta	variablesL+0
+
+; Check for end..
+
+listLoop:
+	ldy	#0
+	lda	(Cursor),y		; Get high byte of line number
+	bpl	:+			; Top bit set is probably $FF which is end of text marker
+
+	rts
+
+; Store line number in RegA and call pDec directly
+
+:	sta	RegA+1
+	iny
+	lda	(Cursor),y		; Get low byte
+	sta	RegA+0
+
+	jsr	pDec
+	lda	#' '			; Followed by a space
+	jsr	putChar
+
+	ldy	#3			; pDec corrupts X & Y. This takes to first byte of line.
+
+printLine:
+	lda	(Cursor),y
+	cmp	#$0D			; CR, end of line?
+	beq	eol
+	jsr	putChar
+	iny
+	bne	printLine
+
+eol:
+	jsr	newLine
+	iny				; Jump over the CR
+
+	tya
+	jsr BumpCursorA			; Set the Cursor to the current (Cursor),y location:
+
+	jmp	listLoop
+.endproc
+
+;* print.h: ======================================================================
+
+;* print.s: ======================================================================
+
+;********************************************************************************
+.proc pDec  ; Print signed decimal number in RegA
+;	See: Mike B's code at:
+;	   http://forum.6502.org/viewtopic.php?f=2&t=4894&start=15#p87300
+
+; Make +ve if it's -ve
+
+	lda	RegA+1
+	bpl	:+
+	sec		; Subtract 1 and invert...
+	lda	RegA+0
+	sbc	#1
+	eor	#$FF
+	sta	RegA+0
+	lda	RegA+1
+	sbc	#0
+	eor	#$FF
+	sta	RegA+1
+	lda	#'-'
+	jsr	putChar
+
+:	lda	variablesL+0	; Get width from the @ variable
+	and	#$7F		; Sanity/Stupidty
+	sta	num
+
+	lda	#0          	; stack sentinel
+	pha			; push sentinel
+pDec2:
+	lda	#0		; init remainder
+	clv			; init "not done" flag
+	ldy	#16		; bit width of argument
+pDec3:
+	cmp	#10/2		; divide argument by 10
+	bcc	pDec4
+	sbc	#10/2+128	; set "not done" flag for
+	sec			;   quotient > 0
+pDec4:
+	rol	RegA+0		; when inner loop is done,
+	rol	RegA+1		;   argument /= 10 ...
+	rol			;   ... and A = remainder
+	dey
+	bne	pDec3		; loop until done dividing
+	ora	#'0'		; xlate remainder to ascii
+	.byte	$CD		; naked cmp abs opcode
+pDecPad:
+	lda	#' '		; Pad character
+	pha			; push digit or pad char
+	dec	num		; update output char count
+	bvs	pDec2		; loop until quotient == 0
+	bpl	pDecPad		; pad any remaining width
+	pla
+pDecOut:
+	jsr	putChar		; output reversed digits
+	pla
+	bne	pDecOut		; until sentinel is popped
+
+ 	rts
+.endproc
+
+;********************************************************************************
+pHex:  ; Print hex number in RegA
+	lda	RegA+1
+	jsr	oHex8
+	lda	RegA+0
+	; Fall into...
+
+oHex8: ; print hex byte in A
+	pha			; Temp. save
+	lsr	a		; A := A >> 4
+	lsr	a
+	lsr	a
+	lsr	a
+	jsr	oHex4		; Print top 4 bits as hex
+	pla			; Restore A and fall into ...
+
+oHex4: ; print hex nibble in A
+	and	#$0F
+
+.if 1 ; The cunningPlan saves 13 bytes....
+	clc
+	sed
+	adc	#$90		; Yields $90-$99 or $00-$05
+	adc	#$40		; Yields $30-$39 or $41-$46
+	cld
+	jmp	putChar
+.else
+	tay
+	lda	@hexTable,y
+	jmp	putChar		; and return
+
+@hexTable:
+	.byte	"0123456789ABCDEF"
+.endif
+
+;********************************************************************************
+.proc pStringV  ; Print memory as a string.
+;	  PRINT $ factor
+;	Note: Strings are zero or CR terminated.
+
+	ldy	#0
+loop:	lda	(RegA),y
+	beq	done
+	cmp	#$0D
+	beq	done
+	jsr	putChar
+	iny
+	bne	loop
+done:
+	rts
+.endproc
+
+;********************************************************************************
+.proc pStringP  ; Print string in program text
+  ;	PRINT "string"
+
+	ldy	#0
+P1:	lda	(Cursor),y	; Fetch the character
+	cmp	#$0D		; CR is error - ran off the end of the line
+	beq	error
+	incCursor		; Next character
+	cmp	#'"'		; Terminating quote?
+	beq	:+
+	jsr	putChar
+	jmp P1
+
+:	rts
+
+error:	lda	#eEND
+	jmp	progErr
+.endproc
+
+
+;********************************************************************************
+DoVdu:  ; Output a character
+	jsr PopYA
+	jmp putChar
+
+;* string.h: =====================================================================
+
+;* string.s: =====================================================================
+
+;********************************************************************************
+.proc putString
+  ; String constant assignment.
+  ; Handles:
+  ;   $ factor = "string"
+
+	ldy	#0
+putLoop:
+	lda	(Cursor),y	; Get character from program text
+	incCursor
+	cmp	#'"'		; end?
+	beq	stringEnd
+	cmp	#$0D		; Make sure it's not a CR (end of prog. line)
+	beq	strOops
+
+	sta	(RegA),y
+	inc	RegA+0
+	bne	putLoop
+	inc	RegA+1
+	bne	putLoop
+
+stringEnd:
+	lda	#$0D		; Append CR to string and return
+	sta	(RegA),y
+	rts
+
+strOops:
+	lda	#eEND
+	jmp	progErr
+.endproc
+
+
+;********************************************************************************
+.proc moveString  ; Handles:  $ factor = $ factor
+
+	jsr PopYA		; pop source ptr
+	sta RegC+0
+	sty RegC+1
+	jsr PopYA		; pop dest ptr
+	sta RegB+0
+	sty RegB+1
+
+	ldy #$ff
+@loop:	iny
+	lda (RegC),y
+	sta (RegB),y
+	cmp #$0D
+	bne @loop
+
+	rts
+.endproc
+
+;********************************************************************************
+.proc	iString  ; Input a string
+;	Handles:
+;	  INPUT $ factor
+;	Input buffer in Cursor, destination in RegA, CR terminated.
+
+
+	ldy	#$FF
+loop:	iny
+	lda	(Cursor),y
+	sta	(RegA),y
+	cmp	#$0D
+	bne	loop
+	rts
+.endproc
+
