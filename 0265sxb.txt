@@ -60,7 +60,7 @@ Start: ; ROM entry point.
 ;*	getChar	 - Return character in A.
 ;*	getLine	 - Read in a line of text
 ;*			Line is CR terminated and located at lineInput.
-;*	CheckKbdInt - Check for Ctrl-C or whatever.
+;*	CheckRx  - Check for input char.  Return Z=0 if char available.
 ;*
 ;*	In-General you need to preserve X and Y with data passed in/out in A.
 
@@ -79,9 +79,9 @@ getChar: ; Wait-for and read a single character back into A.
 	rts
 
 
-CheckKbdInt: ; Check for a keyboard interrupt.
-  ; will be called regularly during program execution and listing. 
-	rts	; not implemented yet.
+CheckRx: ; Check for a keyboard interrupt. 
+	lda #0	; not implemented yet, always return Z=1 (no char)
+	rts
 
 
 putChar: ; Print a single character in A. Preserve X & Y.
@@ -179,7 +179,7 @@ CheckRx: ; move rx hardware to queue
 ;	and #Uart3RxQueSize-1
 	sta Uart3RxInsert
 	.byte $fa	;plx
-@4:	lda Uart3RxExtract
+@4:	lda Uart3RxExtract	; return Z=0 if char available
 	cmp Uart3RxInsert
 	rts
 
@@ -198,19 +198,6 @@ getChar: ; Wait-for and read a single character back into A.
 @3:	stx Uart3RxExtract
 	.byte $fa	;plx
 	rts
-
-
-CheckKbdInt: ; Check for a keyboard interrupt.
-  ; will be called regularly during program execution and listing. 
-	jsr CheckRx		; do Rx chars
-	bne @GotInt		; any Rx ready?
-	rts
-
-@GotInt:
-;	pla			; Remove JSR
-;	pla
-	lda #eBRK
-	jmp progErr
 
 
 putChar: ; Print a single character in A. Preserve X & Y
@@ -337,7 +324,7 @@ getLine:  ; Read in a line of text with simple editing.
 	rts
 
 
-
+TINY_BANNER =1
  .include "gibltc.txt" ; turboGIBL code
 
 

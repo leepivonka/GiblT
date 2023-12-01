@@ -4,6 +4,8 @@
 ;*
 ;* http://cini.classiccmp.org/pdf/NatSemi/SCMPNIBL.PDF
 
+; This is stored at https://github.com/leepivonka/GiblT
+
 ; Modifications & additions to gibl by Lee Pivonka,
 ;   mostly to improve BASIC execution performance.
 ; Compiles 6502 code for the IL instructions.  There is no IL interpreter.
@@ -66,7 +68,6 @@ VDU_HOME	=	 12
 ;* gibl.h: =======================================================================
 
 ;* gibl.s: =======================================================================
-;*	Generic startup after doing all the system specific stuff.
 
  ;========================================================================
 gibl: ; Main GIBL entry point
@@ -76,9 +77,9 @@ gibl: ; Main GIBL entry point
 ;	 is under 4K but we're well on-track there. For now.
 
 	jsr putStr
-	.byte 12,					10	; Clears most screens...
+	.byte 12,					10	; form feed clears most screens...
 
- .if 0 ; VERBOSE_BANNER
+ .ifdef VERBOSE_BANNER
 	.byte	"  ____ ___ ____  _",			13,10
 	.byte	" / ___|_ _| __ )| |",			13,10
 	.byte	"| |  _ | ||  _ \| |",			13,10
@@ -86,12 +87,12 @@ gibl: ; Main GIBL entry point
  	.byte	" \____|___|____/|_____|",		13,10,10
    .endif
 
- .if 0 ; BRIEF_BANNER
+ .ifdef BRIEF_BANNER
 	.byte	"Gordons Interactive BASIC Language: "
 	.byte	.sprintf ("r%02d", release),		13,10
    .endif
 
- .if 1 ; TINY_BANNER
+ .ifdef TINY_BANNER
 	.byte	"GIBL: "
 	.byte	.sprintf ("r%02d", release),		13,10
    .endif
@@ -765,6 +766,19 @@ progErr: ; with error code in A
 	jsr	pDec
 
 :	jmp	progFin		; tidy up
+
+
+CheckKbdInt: ; Check for a keyboard interrupt.
+  ; will be called regularly during program execution and listing. 
+	jsr CheckRx		; do Rx chars
+	bne @GotInt		; any Rx ready?
+	rts
+
+@GotInt:
+;	pla			; Remove JSR
+;	pla
+	lda #eBRK
+	bne progErr
 
 
 ;* findLine.h: ===================================================================
